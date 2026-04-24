@@ -34,6 +34,15 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # ── TacHand-VLA: magnetic tactile modality ─────────────────────────
+    # When True, a tactile token (or set of tokens) is appended to the
+    # suffix sequence. Default False keeps every existing pi0/pi0.5
+    # checkpoint loadable unchanged.
+    use_tactile: bool = False
+    tactile_dim: int = 36                  # 12 taxels × 3 axes (Bx, By, Bz)
+    tactile_encoder_variant: str = "linear"  # "linear" | "per_taxel" | "time_series"
+    tactile_n_tokens: int = 1              # 1 (linear) | 12 (per_taxel) | T (time_series)
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -80,6 +89,10 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                tactile=(
+                    jax.ShapeDtypeStruct([batch_size, 12, 3], jnp.float32)
+                    if self.use_tactile else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

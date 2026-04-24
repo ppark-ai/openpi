@@ -108,6 +108,18 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # ── TacHand-VLA: optional tactile encoder ─────────────────────
+        if getattr(config, "use_tactile", False):
+            from openpi.models_pytorch.tactile_encoder_pytorch import build_tactile_encoder
+
+            self.tactile_encoder = build_tactile_encoder(
+                variant=config.tactile_encoder_variant,
+                width=action_expert_config.width,
+            )
+            self.use_tactile = True
+        else:
+            self.use_tactile = False
+
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
@@ -168,6 +180,7 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            getattr(observation, "tactile", None),  # TacHand-VLA optional
         )
 
     def sample_noise(self, shape, device):
@@ -235,8 +248,13 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, state, noisy_actions, timestep, tactile=None):
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        TacHand-VLA: when `tactile` is provided and `self.use_tactile`, a
+        tactile token (or set of tokens) is inserted between the state
+        token (pi0) / nothing (pi0.5) and the action block.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -260,6 +278,19 @@ class PI0Pytorch(nn.Module):
 
             # Set attention masks so that image and language inputs do not attend to state or actions
             att_masks += [1]
+
+        # ── TacHand-VLA: tactile token(s) ─────────────────────────────
+        if self.use_tactile and tactile is not None:
+            tactile_emb = self.tactile_encoder(tactile)  # (B, n_tact, width)
+            n_tact = tactile_emb.shape[1]
+            embs.append(tactile_emb)
+            pad_masks.append(
+                torch.ones(
+                    tactile_emb.shape[0], n_tact,
+                    dtype=torch.bool, device=tactile_emb.device,
+                )
+            )
+            att_masks += [1] + [0] * (n_tact - 1)
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -316,7 +347,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, tactile = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -329,7 +360,7 @@ class PI0Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time, tactile=tactile)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -381,7 +412,7 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, tactile = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -412,6 +443,7 @@ class PI0Pytorch(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                tactile=tactile,
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
@@ -426,9 +458,10 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        tactile=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep, tactile=tactile)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

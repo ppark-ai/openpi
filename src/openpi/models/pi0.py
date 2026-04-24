@@ -99,6 +99,19 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # ── TacHand-VLA: optional tactile encoder ─────────────────────
+        if getattr(config, "use_tactile", False):
+            from openpi.models.tactile_encoder import build_tactile_encoder
+
+            self.tactile_encoder = build_tactile_encoder(
+                variant=config.tactile_encoder_variant,
+                width=action_expert_config.width,
+                rngs=rngs,
+            )
+            self.use_tactile = True
+        else:
+            self.use_tactile = False
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -155,6 +168,19 @@ class Pi0(_model.BaseModel):
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
             # image/language inputs do not attend to state or actions
             ar_mask += [True]
+
+        # ── TacHand-VLA: tactile token(s) ─────────────────────────────
+        # Inserted between the (optional) state token and the action block.
+        # Action tokens do not attend to tactile yet — first tactile token
+        # is ar=True, the rest ar=False (block-attention within tactile).
+        if self.use_tactile and getattr(obs, "tactile", None) is not None:
+            tactile_tokens = self.tactile_encoder(obs.tactile)
+            n_tact = tactile_tokens.shape[1]
+            tokens.append(tactile_tokens)
+            input_mask.append(
+                jnp.ones((tactile_tokens.shape[0], n_tact), dtype=jnp.bool_)
+            )
+            ar_mask += [True] + [False] * (n_tact - 1)
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
